@@ -311,18 +311,22 @@ void rapl_before(FILE * fp,int core)
 void rapl_after(FILE * fp , int core)
 { int fd;
   long long result;
+  double package_delta;
+  double pp0_delta;
+  int has_pp1 = 0;
+  int has_dram = 0;
+  double pp1_delta = 0.0;
+  double dram_delta = 0.0;
 
   fd=open_msr(core);
 
   result=read_msr(fd,MSR_PKG_ENERGY_STATUS);
   package_after=(double)result*energy_units;
-  //  fprintf(fp,"Package energy: %.6fJ consumed\n",package_after-package_before);
-  fprintf(fp,"%.18f, ",package_after-package_before);  // PACKAGE
+  package_delta = package_after - package_before;
 
   result=read_msr(fd,MSR_PP0_ENERGY_STATUS);
   pp0_after=(double)result*energy_units;
-
-  fprintf(fp,"%.18f, ",pp0_after-pp0_before);    // CORE
+  pp0_delta = pp0_after - pp0_before;
 
 
   /* not available on SandyBridge-EP */
@@ -330,18 +334,25 @@ void rapl_after(FILE * fp , int core)
   (cpu_model==CPU_HASWELL)) {
      result=read_msr(fd,MSR_PP1_ENERGY_STATUS);
      pp1_after=(double)result*energy_units;
-     fprintf(fp,"%.18f, ",pp1_after-pp1_before);     // GPU
+     has_pp1 = 1;
+     pp1_delta = pp1_after - pp1_before;
   }
-  else
-    fprintf(fp," , ");
 
   if ((cpu_model==CPU_SANDYBRIDGE_EP) || (cpu_model==CPU_IVYBRIDGE_EP) ||
   (cpu_model==CPU_HASWELL)) {
      result=read_msr(fd,MSR_DRAM_ENERGY_STATUS);
      dram_after=(double)result*energy_units;
-     fprintf(fp,"%.18f, ",dram_after-dram_before);     // DRAM
+     has_dram = 1;
+     dram_delta = dram_after - dram_before;
   }
-  else
-    fprintf(fp," , ");  
+
+  fprintf(fp, "%.18f,%.18f,", package_delta, pp0_delta);
+  if (has_pp1) {
+    fprintf(fp, "%.18f", pp1_delta);
+  }
+  fprintf(fp, ",");
+  if (has_dram) {
+    fprintf(fp, "%.18f", dram_delta);
+  }
 
 }
