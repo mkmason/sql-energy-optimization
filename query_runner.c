@@ -30,6 +30,17 @@ static double get_time_sec(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/* helper to call the script; drop the script into the same directory or adjust path */
+static void post_sigless_script(const char *remote, const char *channel, const char *msg) {
+    char cmd[2048];
+    int n = snprintf(cmd, sizeof(cmd),
+                     "sh ./post_to_sigless.sh %s %s \"%s\" >/dev/null 2>&1",
+                     remote, channel, msg);
+    if (n > 0 && n < (int)sizeof(cmd)) {
+        system(cmd);
+    }
+}
+
 /* Simple comparator for qsort */
 static int cmp_queries(const void *a, const void *b) {
     const char * const *pa = a;
@@ -159,6 +170,10 @@ int main(void) {
         double total_elapsed = 0.0;
         int failures = 0;
 
+        post_sigless_script(getenv("SIGLESS_ADDR") ? getenv("SIGLESS_ADDR") : "127.0.0.1:8000",
+                    getenv("SIGLESS_CHANNEL") ? getenv("SIGLESS_CHANNEL") : "CH1",
+                    files[f]); // message: filename
+
         rapl_before(log, core);
 
         // Run exactly RUNS iterations; measure elapsed per iteration and accumulate.
@@ -188,6 +203,11 @@ int main(void) {
         fprintf(log, "  Total time for %d runs: %.6f sec (failures: %d)\n", RUNS, total_elapsed, failures);
         fprintf(log, "  RAPL delta (package, core, gpu, dram): ");
         rapl_after(log, core);
+
+        post_sigless_script(getenv("SIGLESS_ADDR") ? getenv("SIGLESS_ADDR") : "127.0.0.1:8000",
+                    getenv("SIGLESS_CHANNEL") ? getenv("SIGLESS_CHANNEL") : "CH1",
+                    "stop");
+
         fprintf(log, "\n");
         printf("  Total time: %.6f sec (failures: %d)\n\n", total_elapsed, failures);
 
