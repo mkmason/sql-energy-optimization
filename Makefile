@@ -42,6 +42,11 @@ SIGLESS_BIN ?= sigless
 SIGLESS_PORT ?= 8000
 SIGLESS_OUT ?= ./logs
 SIGLESS_PID_FILE := .sigless.pid
+TPCH_DBGEN_REPO ?= https://github.com/electrum/tpch-dbgen
+TPCH_DBGEN_DIR ?= $(CURDIR)/tpch-dbgen
+TPCH_SCALE ?= 1
+PGUSER ?= postgres
+PGDATABASE ?= tpch
 
 sigless-sim-start:
 	@echo "Starting Sigless in simulation mode..."
@@ -64,3 +69,81 @@ sigless-sim-end:
 	@kill `cat $(SIGLESS_PID_FILE)` 2>/dev/null || true
 	@rm -f $(SIGLESS_PID_FILE)
 	@echo "Sigless stopped."
+
+
+setup:
+	@set -e; \
+	echo "Installing required system packages (build-essential, git, postgresql)..."; \
+	sudo apt update; \
+	sudo apt install -y build-essential git postgresql postgresql-contrib
+	@set -e; \
+	if [ ! -d "$(TPCH_DBGEN_DIR)" ]; then \
+		echo "Cloning tpch-dbgen into $(TPCH_DBGEN_DIR)..."; \
+		git clone "$(TPCH_DBGEN_REPO)" "$(TPCH_DBGEN_DIR)"; \
+	else \
+		echo "tpch-dbgen already exists at $(TPCH_DBGEN_DIR), skipping clone."; \
+	fi
+	@set -e; \
+	echo "Building tpch-dbgen..."; \
+	$(MAKE) -C "$(TPCH_DBGEN_DIR)"
+	@set -e; \
+	echo "Generating TPC-H data with scale factor $(TPCH_SCALE)..."; \
+	cd "$(TPCH_DBGEN_DIR)"; \
+	./dbgen -s "$(TPCH_SCALE)"
+	@set -e; \
+	echo "Removing trailing delimiters from generated .tbl files..."; \
+	sed -i 's/|$$//' "$(TPCH_DBGEN_DIR)"/*.tbl
+	@set -e; \
+	echo "Ensuring PostgreSQL database $(PGDATABASE) exists..."; \
+	sudo -u "$(PGUSER)" psql -tAc "SELECT 1 FROM pg_database WHERE datname='$(PGDATABASE)'" | grep -q 1 || \
+		sudo -u "$(PGUSER)" psql -c "CREATE DATABASE $(PGDATABASE);"
+	@set -e; \
+	echo "Applying schema from tpch_schema.sql..."; \
+	sudo -u "$(PGUSER)" psql -d "$(PGDATABASE)" -f "$(CURDIR)/tpch_schema.sql"
+	@set -e; \
+	echo "Creating load script for generated TPC-H tables..."; \
+	printf "%s\n" \
+		"\\copy region   FROM '$(TPCH_DBGEN_DIR)/region.tbl'   WITH (FORMAT csv, DELIMITER '|');" \
+		"\\copy nation   FROM '$(TPCH_DBGEN_DIR)/nation.tbl'   WITH (FORMAT csv, DELIMITER '|');" \
+		"\\copy supplier FROM '$(TPCH_DBGEN_DIR)/supplier.tbl' WITH (FORMAT csv, DELIMITER '|');" \
+		"\\copy customer FROM '$(TPCH_DBGEN_DIR)/customer.tbl' WITH (FORMAT csv, DELIMITER '|');" \
+		"\\copy part     FROM '$(TPCH_DBGEN_DIR)/part.tbl'     WITH (FORMAT csv, DELIMITER '|');" \
+		"\\copy partsupp FROM '$(TPCH_DBGEN_DIR)/partsupp.tbl' WITH (FORMAT csv, DELIMITER '|');" \
+		"\\copy orders   FROM '$(TPCH_DBGEN_DIR)/orders.tbl'   WITH (FORMAT csv, DELIMITER '|');" \
+		"\\copy lineitem FROM '$(TPCH_DBGEN_DIR)/lineitem.tbl' WITH (FORMAT csv, DELIMITER '|');" \
+	> "$(TPCH_DBGEN_DIR)/load_tpch.sql"
+	@set -e; \
+	echo "Loading generated data into $(PGDATABASE)..."; \
+	sudo -u "$(PGUSER)" psql -d "$(PGDATABASE)" -f "$(TPCH_DBGEN_DIR)/load_tpch.sql"
+	@set -e; \
+	echo "Applying post-load preparation from tpch_prep.sql..."; \
+	sudo -u "$(PGUSER)" psql -d "$(PGDATABASE)" -f "$(CURDIR)/tpch_prep.sql"
+	@echo "Setup completed successfully."
+#sudo mkdir /home/user01/workspace
+#cd /home/user01/workspace
+#sudo apt update
+#sudo apt install build-essential
+#git clone https://github.com/electrum/tpch-dbgen
+#cd tpch-dbgen
+#make
+#./dbgen -s 1
+#sudo -u postgres psql
+#CREATE DATABASE tpch;
+#\c tpch
+#sudo -u postgres psql -d tpch -f tpch_schema.sql
+#sed -i 's/|$//' *.tbl
+#cd /home/user01/workspace/tpch-dbgen
+#chmod a+r ~/workspace/tpch-dbgen/*.tbl
+#nano load_tpch.sql
+#\copy region   FROM 'region.tbl'   WITH (FORMAT csv, DELIMITER '|');
+#\copy nation   FROM 'nation.tbl'   WITH (FORMAT csv, DELIMITER '|');
+#\copy supplier FROM 'supplier.tbl' WITH (FORMAT csv, DELIMITER '|');
+#\copy customer FROM 'customer.tbl' WITH (FORMAT csv, DELIMITER '|');
+#\copy part     FROM 'part.tbl'     WITH (FORMAT csv, DELIMITER '|');
+#\copy partsupp FROM 'partsupp.tbl' WITH (FORMAT csv, DELIMITER '|');
+#\copy orders   FROM 'orders.tbl'   WITH (FORMAT csv, DELIMITER '|');
+#\copy lineitem FROM 'lineitem.tbl' WITH (FORMAT csv, DELIMITER '|');
+#cd ~/workspace/tpch-dbgen
+#sudo -u postgres psql -d tpch -f load_tpch.sql
+#cd ~/workspace
+#sudo -u postgres psql -d tpch -f tpch_prep.sql
