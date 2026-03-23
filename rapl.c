@@ -86,6 +86,7 @@ int detect_cpu(void) {
 
 			if (strncmp(vendor,"GenuineIntel",12)) {
 				printf("%s not an Intel chip\n",vendor);
+        fclose(fff);
 				return -1;
 			}
 		}
@@ -94,6 +95,7 @@ int detect_cpu(void) {
 			sscanf(result,"%*s%*s%*s%d",&family);
 			if (family!=6) {
 				printf("Wrong CPU family %d\n",family);
+        fclose(fff);
 				return -1;
 			}
 		}
@@ -180,6 +182,8 @@ int rapl_init(int core)
   energy_units=pow(0.5,(double)((result>>8)&0x1f));
   time_units=pow(0.5,(double)((result>>16)&0xf));
 
+  close(fd);
+
   /*
   printf("Power units = %.3fW\n",power_units);
   printf("Energy units = %.8fJ\n",energy_units);
@@ -215,6 +219,8 @@ void show_power_info(int core)
 
   time_window=time_units*(double)((result>>48)&0x7fff);
   printf("Package maximum time window: %.6fs\n",time_window);
+
+  close(fd);
 }
 
 
@@ -242,6 +248,8 @@ void show_power_limit(int core)
           (result & (1LL<<48)) ? "clamped" : "not_clamped");
 
   printf("\n");
+
+  close(fd);
 
 }
 
@@ -305,6 +313,8 @@ void rapl_before(FILE * fp,int core)
      // fprintf(fp,"DRAM energy before: %.6fJ\n",dram_before);
   }
 
+  close(fd);
+
 }
 
 
@@ -354,5 +364,7 @@ void rapl_after(FILE * fp , int core)
   if (has_dram) {
     fprintf(fp, "%.18f", dram_delta);
   }
+
+  close(fd);
 
 }
