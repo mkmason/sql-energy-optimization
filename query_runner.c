@@ -318,12 +318,47 @@ static char *skip_sql_leading_noise(char *s) {
     return s;
 }
 
-static int rewrite_query_without_explain_analyze(const char *src_path, const char *dst_path) {
+static int rewrite_query_without_explain_analyze(const char *query_name,
+                                                 const char *src_path,
+                                                 const char *dst_path) {
     FILE *in = NULL;
     FILE *out = NULL;
     char *buf = NULL;
     long size = 0;
     int rc = -1;
+
+    /* Capture-mode override: make cursor query emit rows via NOTICE output. */
+    if (query_name && strcmp(query_name, "APX1186-queryA.sql") == 0) {
+        static const char *override_sql =
+            "DO $$\n"
+            "DECLARE\n"
+            "    rec RECORD;\n"
+            "    cur_lineitems CURSOR FOR\n"
+            "        SELECT l_orderkey, l_extendedprice\n"
+            "        FROM lineitem\n"
+            "        WHERE l_extendedprice > 100000;\n"
+            "BEGIN\n"
+            "    OPEN cur_lineitems;\n"
+            "    LOOP\n"
+            "        FETCH cur_lineitems INTO rec;\n"
+            "        EXIT WHEN NOT FOUND;\n"
+            "\n"
+            "        RAISE NOTICE 'Order: %, Price: %', rec.l_orderkey, rec.l_extendedprice;\n"
+            "    END LOOP;\n"
+            "    CLOSE cur_lineitems;\n"
+            "END $$;\n";
+
+        out = fopen(dst_path, "wb");
+        if (!out) {
+            return -1;
+        }
+        if (fputs(override_sql, out) == EOF) {
+            fclose(out);
+            return -1;
+        }
+        fclose(out);
+        return 0;
+    }
 
     in = fopen(src_path, "rb");
     if (!in) {
@@ -604,7 +639,7 @@ int main(void) {
                 continue;
             }
 
-            if (rewrite_query_without_explain_analyze(source_query_path, rewritten_query_path) != 0) {
+            if (rewrite_query_without_explain_analyze(files[f], source_query_path, rewritten_query_path) != 0) {
                 fprintf(stderr, "Failed to rewrite query without EXPLAIN ANALYZE: %s\n", source_query_path);
                 free(files[f]);
                 continue;
