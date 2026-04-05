@@ -8,6 +8,13 @@ SRC     = query_runner.c rapl.c
 RUNNER_PREFIX ?= sudo
 SUDO_PASSWORD ?= a
 SUDO_PRIME_CMD = printf '%s\n' '$(SUDO_PASSWORD)' | sudo -S -v >/dev/null 2>&1
+PERF_ENABLE ?= 1
+PERF_OUTPUT_DIR ?= logs/perf_runs
+PERF_EVENTS ?= cycles,instructions,branches,branch-misses,cache-references,cache-misses,context-switches,cpu-migrations,page-faults
+OUTPUT_CAPTURE_ENABLE ?= 1
+OUTPUT_CAPTURE_DIR ?= logs/query_outputs
+OUTPUT_CAPTURE_SQL_DIR ?= logs/rewritten_queries
+OUTPUT_CAPTURE_LOG_FILE ?= logs/query_output_sizes.csv
 
 # Default target
 all: compile
@@ -31,6 +38,36 @@ ifndef QUERY
 endif
 	@$(SUDO_PRIME_CMD)
 	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) ./$(TARGET)
+
+# Run all queries with PERF stat enabled (per query execution output files)
+run-perf: compile
+	@$(SUDO_PRIME_CMD)
+	$(RUNNER_PREFIX) env PERF_ENABLE=$(PERF_ENABLE) PERF_OUTPUT_DIR="$(PERF_OUTPUT_DIR)" PERF_EVENTS="$(PERF_EVENTS)" ./$(TARGET)
+
+# Run a specific query filter with PERF stat enabled
+# Usage:
+#   make run-perf-single QUERY=APX1090
+run-perf-single: compile
+ifndef QUERY
+	$(error You must provide QUERY. Example: make run-perf-single QUERY=APX1090)
+endif
+	@$(SUDO_PRIME_CMD)
+	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) PERF_ENABLE=$(PERF_ENABLE) PERF_OUTPUT_DIR="$(PERF_OUTPUT_DIR)" PERF_EVENTS="$(PERF_EVENTS)" ./$(TARGET)
+
+# Capture full query output for size analysis (forces 1 run/query/loop in runner)
+run-output-capture: compile
+	@$(SUDO_PRIME_CMD)
+	$(RUNNER_PREFIX) env OUTPUT_CAPTURE_ENABLE=$(OUTPUT_CAPTURE_ENABLE) OUTPUT_CAPTURE_DIR="$(OUTPUT_CAPTURE_DIR)" OUTPUT_CAPTURE_SQL_DIR="$(OUTPUT_CAPTURE_SQL_DIR)" OUTPUT_CAPTURE_LOG_FILE="$(OUTPUT_CAPTURE_LOG_FILE)" ./$(TARGET)
+
+# Capture full output for one filtered query set
+# Usage:
+#   make run-output-capture-single QUERY=APX1090
+run-output-capture-single: compile
+ifndef QUERY
+	$(error You must provide QUERY. Example: make run-output-capture-single QUERY=APX1090)
+endif
+	@$(SUDO_PRIME_CMD)
+	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) OUTPUT_CAPTURE_ENABLE=$(OUTPUT_CAPTURE_ENABLE) OUTPUT_CAPTURE_DIR="$(OUTPUT_CAPTURE_DIR)" OUTPUT_CAPTURE_SQL_DIR="$(OUTPUT_CAPTURE_SQL_DIR)" OUTPUT_CAPTURE_LOG_FILE="$(OUTPUT_CAPTURE_LOG_FILE)" ./$(TARGET)
 
 # Optional: clean build artifacts
 clean:
