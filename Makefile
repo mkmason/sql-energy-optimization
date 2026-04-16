@@ -15,6 +15,10 @@ OUTPUT_CAPTURE_ENABLE ?= 1
 OUTPUT_CAPTURE_DIR ?= logs/query_outputs
 OUTPUT_CAPTURE_SQL_DIR ?= logs/rewritten_queries
 OUTPUT_CAPTURE_LOG_FILE ?= logs/query_output_sizes.csv
+DETAILED_PERF_ENABLE ?= 1
+DETAILED_PERF_OUTPUT_DIR ?= logs/detailed_perf_runs
+DETAILED_PERF_LOG_FILE ?= logs/detailed_perf_runs.csv
+DETAILED_PERF_INTERVAL_SEC ?= 1
 
 # Default target
 all: compile
@@ -68,6 +72,21 @@ ifndef QUERY
 endif
 	@$(SUDO_PRIME_CMD)
 	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) OUTPUT_CAPTURE_ENABLE=$(OUTPUT_CAPTURE_ENABLE) OUTPUT_CAPTURE_DIR="$(OUTPUT_CAPTURE_DIR)" OUTPUT_CAPTURE_SQL_DIR="$(OUTPUT_CAPTURE_SQL_DIR)" OUTPUT_CAPTURE_LOG_FILE="$(OUTPUT_CAPTURE_LOG_FILE)" ./$(TARGET)
+
+# Detailed PERF run with interval sampling and turbostat temperature/frequency data
+run-perf-detailed: compile
+	@$(SUDO_PRIME_CMD)
+	$(RUNNER_PREFIX) env DETAILED_PERF_ENABLE=$(DETAILED_PERF_ENABLE) DETAILED_PERF_OUTPUT_DIR="$(DETAILED_PERF_OUTPUT_DIR)" DETAILED_PERF_LOG_FILE="$(DETAILED_PERF_LOG_FILE)" DETAILED_PERF_INTERVAL_SEC=$(DETAILED_PERF_INTERVAL_SEC) ./$(TARGET)
+
+# Detailed PERF run for one query filter
+# Usage:
+#   make run-perf-detailed-single QUERY=APX1090
+run-perf-detailed-single: compile
+ifndef QUERY
+	$(error You must provide QUERY. Example: make run-perf-detailed-single QUERY=APX1090)
+endif
+	@$(SUDO_PRIME_CMD)
+	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) DETAILED_PERF_ENABLE=$(DETAILED_PERF_ENABLE) DETAILED_PERF_OUTPUT_DIR="$(DETAILED_PERF_OUTPUT_DIR)" DETAILED_PERF_LOG_FILE="$(DETAILED_PERF_LOG_FILE)" DETAILED_PERF_INTERVAL_SEC=$(DETAILED_PERF_INTERVAL_SEC) ./$(TARGET)
 
 # Optional: clean build artifacts
 clean:

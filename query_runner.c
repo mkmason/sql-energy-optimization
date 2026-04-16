@@ -33,10 +33,14 @@
 #define DEFAULT_SIGLESS_CHANNEL "CH1"
 #define DEFAULT_SUDO_PASSWORD "a"
 #define DEFAULT_PERF_OUTPUT_DIR "logs/perf_runs"
-#define DEFAULT_PERF_EVENTS "cycles,instructions,branches,branch-misses,cache-references,cache-misses,context-switches,cpu-migrations,page-faults"
+#define DEFAULT_PERF_EVENTS "cycles,instructions,branches,branch-misses,cache-references,cache-misses,context-switches,cpu-migrations,page-faults,ref-cycles,cpu-clock,task-clock"
 #define DEFAULT_CAPTURE_OUTPUT_DIR "logs/query_outputs"
 #define DEFAULT_CAPTURE_SQL_DIR "logs/rewritten_queries"
 #define DEFAULT_CAPTURE_SIZE_LOG_FILE "logs/query_output_sizes.csv"
+#define DEFAULT_DETAILED_PERF_OUTPUT_DIR "logs/detailed_perf_runs"
+#define DEFAULT_DETAILED_PERF_LOG_FILE "logs/detailed_perf_runs.csv"
+#define DEFAULT_DETAILED_PERF_INTERVAL_SEC 1
+#define DEFAULT_DETAILED_TURBOSTAT_COLUMNS "Core,CPU,Avg_MHz,Busy%,Bzy_MHz,TSC_MHz,IPC,CoreTmp,PkgTmp,PkgWatt,CorWatt,RAMWatt"
 
 static double get_time_sec(void) {
     struct timespec ts;
@@ -430,6 +434,48 @@ static long long file_size_bytes(const char *path) {
     return (long long)st.st_size;
 }
 
+static int tool_available(const char *tool_name) {
+    char cmd[256];
+    int n = snprintf(cmd, sizeof(cmd), "command -v %s >/dev/null 2>&1", tool_name);
+    if (n <= 0 || n >= (int)sizeof(cmd)) {
+        return 0;
+    }
+    return system(cmd) == 0;
+}
+
+static int write_detailed_perf_metadata_file(const char *detailed_perf_output_dir,
+                                             const char *run_id,
+                                             const char *run_started_utc,
+                                             const char *query_dir,
+                                             const char *query_filter,
+                                             const char *perf_events,
+                                             const char *turbostat_columns,
+                                             int interval_sec) {
+    char path[PATH_MAX];
+    FILE *fp;
+
+    int n = snprintf(path, sizeof(path), "%s/%s__detailed_perf_metadata.txt", detailed_perf_output_dir, run_id);
+    if (n <= 0 || n >= (int)sizeof(path)) {
+        return -1;
+    }
+
+    fp = fopen(path, "w");
+    if (!fp) {
+        return -1;
+    }
+
+    fprintf(fp, "run_id=%s\n", run_id);
+    fprintf(fp, "run_started_utc=%s\n", run_started_utc);
+    fprintf(fp, "query_dir=%s\n", query_dir ? query_dir : "");
+    fprintf(fp, "query_filter=%s\n", query_filter ? query_filter : "all");
+    fprintf(fp, "perf_events=%s\n", perf_events ? perf_events : "");
+    fprintf(fp, "turbostat_columns=%s\n", turbostat_columns ? turbostat_columns : "");
+    fprintf(fp, "sample_interval_sec=%d\n", interval_sec);
+
+    fclose(fp);
+    return 0;
+}
+
 int main(void) {
     const char *query_dir = getenv("QUERY_DIR");
     if (!query_dir) query_dir = DEFAULT_QUERY_DIR;
@@ -447,12 +493,33 @@ int main(void) {
     const char *capture_output_dir = getenv("OUTPUT_CAPTURE_DIR");
     const char *capture_sql_dir = getenv("OUTPUT_CAPTURE_SQL_DIR");
     const char *capture_size_log_file = getenv("OUTPUT_CAPTURE_LOG_FILE");
+    const char *detailed_perf_enable_env = getenv("DETAILED_PERF_ENABLE");
+    const char *detailed_perf_output_dir = getenv("DETAILED_PERF_OUTPUT_DIR");
+    const char *detailed_perf_log_file = getenv("DETAILED_PERF_LOG_FILE");
+    const char *detailed_perf_interval_env = getenv("DETAILED_PERF_INTERVAL_SEC");
+    const char *detailed_turbostat_columns = getenv("DETAILED_TURBOSTAT_COLUMNS");
     int perf_enabled = env_is_true(perf_enable_env);
     int capture_enabled = env_is_true(capture_enable_env);
+    int detailed_perf_enabled = env_is_true(detailed_perf_enable_env);
+    int detailed_perf_interval_sec = DEFAULT_DETAILED_PERF_INTERVAL_SEC;
+
+    if (detailed_perf_interval_env && *detailed_perf_interval_env) {
+        int parsed_interval = atoi(detailed_perf_interval_env);
+        if (parsed_interval > 0) {
+            detailed_perf_interval_sec = parsed_interval;
+        }
+    }
 
     if (capture_enabled && perf_enabled) {
         fprintf(stderr, "OUTPUT_CAPTURE_ENABLE and PERF_ENABLE are both set; disabling PERF for capture mode.\n");
         perf_enabled = 0;
+    }
+    if (detailed_perf_enabled) {
+        if (perf_enabled || capture_enabled) {
+            fprintf(stderr, "DETAILED_PERF_ENABLE overrides PERF_ENABLE and OUTPUT_CAPTURE_ENABLE.\n");
+        }
+        perf_enabled = 0;
+        capture_enabled = 0;
     }
 
     if (!perf_output_dir || !*perf_output_dir) {
@@ -469,6 +536,15 @@ int main(void) {
     }
     if (!capture_size_log_file || !*capture_size_log_file) {
         capture_size_log_file = DEFAULT_CAPTURE_SIZE_LOG_FILE;
+    }
+    if (!detailed_perf_output_dir || !*detailed_perf_output_dir) {
+        detailed_perf_output_dir = DEFAULT_DETAILED_PERF_OUTPUT_DIR;
+    }
+    if (!detailed_perf_log_file || !*detailed_perf_log_file) {
+        detailed_perf_log_file = DEFAULT_DETAILED_PERF_LOG_FILE;
+    }
+    if (!detailed_turbostat_columns || !*detailed_turbostat_columns) {
+        detailed_turbostat_columns = DEFAULT_DETAILED_TURBOSTAT_COLUMNS;
     }
 
     const char *filter = getenv("QUERY_FILTER"); // if NULL -> treat as "all"
@@ -497,6 +573,7 @@ int main(void) {
     utc_timestamp_now(run_started_utc, sizeof(run_started_utc));
 
     FILE *capture_log = NULL;
+    FILE *detailed_perf_log = NULL;
     if (capture_enabled) {
         struct stat cap_st;
         int needs_capture_header;
@@ -553,10 +630,68 @@ int main(void) {
         fflush(stdout);
     }
 
+    if (detailed_perf_enabled) {
+        struct stat detailed_st;
+        int needs_detailed_header;
+
+        if (!tool_available("perf")) {
+            fprintf(stderr, "perf is not available on PATH.\n");
+            if (capture_log) fclose(capture_log);
+            fclose(log);
+            return 1;
+        }
+        if (!tool_available("turbostat")) {
+            fprintf(stderr, "turbostat is not available on PATH. Temperature/frequency sampling will not work.\n");
+            if (capture_log) fclose(capture_log);
+            fclose(log);
+            return 1;
+        }
+        if (ensure_dir_exists(detailed_perf_output_dir) != 0) {
+            fprintf(stderr, "Failed to create detailed PERF output dir: %s\n", detailed_perf_output_dir);
+            if (capture_log) fclose(capture_log);
+            fclose(log);
+            return 1;
+        }
+
+        if (write_detailed_perf_metadata_file(detailed_perf_output_dir,
+                                              run_id,
+                                              run_started_utc,
+                                              query_dir,
+                                              filter_all ? "all" : filter,
+                                              perf_events,
+                                              detailed_turbostat_columns,
+                                              detailed_perf_interval_sec) != 0) {
+            fprintf(stderr, "Failed to write detailed PERF metadata file in: %s\n", detailed_perf_output_dir);
+            if (capture_log) fclose(capture_log);
+            fclose(log);
+            return 1;
+        }
+
+        needs_detailed_header = (stat(detailed_perf_log_file, &detailed_st) != 0 || detailed_st.st_size == 0);
+        detailed_perf_log = fopen(detailed_perf_log_file, "a");
+        if (!detailed_perf_log) {
+            perror("fopen detailed PERF log file");
+            if (capture_log) fclose(capture_log);
+            fclose(log);
+            return 1;
+        }
+        if (needs_detailed_header) {
+            fprintf(detailed_perf_log,
+                    "timestamp_utc,run_id,test_name,loop_index,run_index,effective_runs,perf_file,turbostat_file,exit_code,source_query_file,detailed_perf_output_dir,sample_interval_sec,run_started_utc\n");
+            fflush(detailed_perf_log);
+        }
+
+        printf("Detailed PERF mode enabled. Runs per loop follow RUNS=%d with continuous interval sampling.\n", RUNS);
+        printf("Detailed PERF outputs in %s\n", detailed_perf_output_dir);
+        printf("Detailed turbostat columns: %s\n", detailed_turbostat_columns);
+        fflush(stdout);
+    }
+
     DIR *dir = opendir(query_dir);
     if (!dir) {
         fprintf(stderr, "opendir(%s): %s\n", query_dir, strerror(errno));
         if (capture_log) fclose(capture_log);
+        if (detailed_perf_log) fclose(detailed_perf_log);
         fclose(log);
         return 1;
     }
@@ -586,6 +721,7 @@ int main(void) {
         fprintf(log, "No matching queries found in %s (filter='%s')\n",
                 query_dir, filter ? filter : "NULL");
         if (capture_log) fclose(capture_log);
+        if (detailed_perf_log) fclose(detailed_perf_log);
         fclose(log);
         return 1;
     }
@@ -599,6 +735,7 @@ int main(void) {
             free(files[i]);
         }
         if (capture_log) fclose(capture_log);
+        if (detailed_perf_log) fclose(detailed_perf_log);
         fclose(log);
         return 1;
     }
@@ -609,6 +746,7 @@ int main(void) {
             free(files[i]);
         }
         if (capture_log) fclose(capture_log);
+        if (detailed_perf_log) fclose(detailed_perf_log);
         fclose(log);
         return 1;
     }
@@ -617,8 +755,12 @@ int main(void) {
         const int effective_runs = capture_enabled ? 1 : RUNS;
         char rewritten_query_path[PATH_MAX];
         char source_query_path[PATH_MAX];
+        char detailed_perf_file[PATH_MAX];
+        char detailed_turbostat_file[PATH_MAX];
         source_query_path[0] = '\0';
         rewritten_query_path[0] = '\0';
+        detailed_perf_file[0] = '\0';
+        detailed_turbostat_file[0] = '\0';
 
         int sp = snprintf(source_query_path, sizeof(source_query_path), "%s/%s", query_dir, files[f]);
         if (sp <= 0 || sp >= (int)sizeof(source_query_path)) {
@@ -646,6 +788,29 @@ int main(void) {
             }
         }
 
+        if (detailed_perf_enabled) {
+            char safe_name[256];
+            sanitize_for_filename(files[f], safe_name, sizeof(safe_name));
+
+            int pp = snprintf(detailed_perf_file, sizeof(detailed_perf_file),
+                              "%s/%s__%s.perf.csv",
+                              detailed_perf_output_dir, run_id, safe_name);
+            if (pp <= 0 || pp >= (int)sizeof(detailed_perf_file)) {
+                fprintf(stderr, "Detailed PERF aggregate path truncated for %s\n", files[f]);
+                free(files[f]);
+                continue;
+            }
+
+            int tp = snprintf(detailed_turbostat_file, sizeof(detailed_turbostat_file),
+                              "%s/%s__%s.turbostat.csv",
+                              detailed_perf_output_dir, run_id, safe_name);
+            if (tp <= 0 || tp >= (int)sizeof(detailed_turbostat_file)) {
+                fprintf(stderr, "Detailed turbostat aggregate path truncated for %s\n", files[f]);
+                free(files[f]);
+                continue;
+            }
+        }
+
         printf("Running %s  (%d runs x %d loops)\n", files[f], effective_runs, LOOPS);
         fflush(stdout);
 
@@ -666,13 +831,37 @@ int main(void) {
 
             rapl_before(log, core);
 
-            // Capture mode intentionally forces one run per loop; performance mode keeps RUNS.
+            // Capture mode intentionally forces one run per loop; PERF and detailed PERF keep RUNS.
             for (int i = 0; i < effective_runs; i++) {
                 char cmd[MAX_CMD];
                 char capture_output_file[PATH_MAX];
                 capture_output_file[0] = '\0';
 
-                if (capture_enabled) {
+                if (detailed_perf_enabled) {
+                    const char *query_exec_path = source_query_path;
+
+                    int n = snprintf(cmd, sizeof(cmd),
+                                     "sudo -n sh -c '"
+                                     "turbostat --quiet --show \"%s\" --interval %d >> \"%s\" 2>/dev/null & "
+                                     "tpid=$!; "
+                                     "perf stat --append -I %d -x, -a -e %s -o \"%s\" -- "
+                                     "sudo -n sh -c \"r=1; while [ \\$r -le %d ]; do sudo -n -u postgres psql -d tpch -f \\\"%s\\\" > /dev/null 2>&1 || exit \\$?; r=\\$((r+1)); done\"; "
+                                     "status=$?; "
+                                     "kill -INT $tpid >/dev/null 2>&1 || true; "
+                                     "wait $tpid >/dev/null 2>&1 || true; "
+                                     "exit $status'",
+                                     detailed_turbostat_columns,
+                                     detailed_perf_interval_sec, detailed_turbostat_file,
+                                     detailed_perf_interval_sec * 1000, perf_events,
+                                     detailed_perf_file, effective_runs, query_exec_path);
+                    if (n <= 0 || n >= (int)sizeof(cmd)) {
+                        failures++;
+                        fprintf(stderr,
+                                "  Warning: detailed PERF command truncated for %s [loop %d/%d]\n",
+                                files[f], loop_idx, LOOPS);
+                        continue;
+                    }
+                } else if (capture_enabled) {
                     char safe_name[256];
                     sanitize_for_filename(files[f], safe_name, sizeof(safe_name));
                     int p = snprintf(capture_output_file, sizeof(capture_output_file),
@@ -745,8 +934,13 @@ int main(void) {
 
                 if (ret != 0) {
                     failures++;
-                    fprintf(stderr, "  Warning: run %d failed (code %d) for %s [loop %d/%d]\n",
-                            i + 1, ret, files[f], loop_idx, LOOPS);
+                    if (detailed_perf_enabled) {
+                        fprintf(stderr, "  Warning: detailed PERF batch failed (code %d) for %s [loop %d/%d]\n",
+                                ret, files[f], loop_idx, LOOPS);
+                    } else {
+                        fprintf(stderr, "  Warning: run %d failed (code %d) for %s [loop %d/%d]\n",
+                                i + 1, ret, files[f], loop_idx, LOOPS);
+                    }
                 }
 
                 if (capture_enabled && capture_log) {
@@ -771,6 +965,36 @@ int main(void) {
                     csv_write_field(capture_log, run_started_utc);
                     fprintf(capture_log, "\n");
                     fflush(capture_log);
+                }
+
+                if (detailed_perf_enabled && detailed_perf_log) {
+                    char timestamp_utc[32];
+
+                    utc_timestamp_now(timestamp_utc, sizeof(timestamp_utc));
+
+                    csv_write_field(detailed_perf_log, timestamp_utc);
+                    fprintf(detailed_perf_log, ",");
+                    csv_write_field(detailed_perf_log, run_id);
+                    fprintf(detailed_perf_log, ",");
+                    csv_write_field(detailed_perf_log, files[f]);
+                    fprintf(detailed_perf_log, ",%d,%d,%d,", loop_idx, i + 1, effective_runs);
+                    csv_write_field(detailed_perf_log, detailed_perf_file);
+                    fprintf(detailed_perf_log, ",");
+                    csv_write_field(detailed_perf_log, detailed_turbostat_file);
+                    fprintf(detailed_perf_log, ",%d,", ret);
+                    csv_write_field(detailed_perf_log, source_query_path);
+                    fprintf(detailed_perf_log, ",");
+                    csv_write_field(detailed_perf_log, detailed_perf_output_dir);
+                    fprintf(detailed_perf_log, ",%d,", detailed_perf_interval_sec);
+                    csv_write_field(detailed_perf_log, run_started_utc);
+                    fprintf(detailed_perf_log, "\n");
+                    fflush(detailed_perf_log);
+                }
+
+                if (detailed_perf_enabled) {
+                    printf("  loop %d/%d completed %d/%d\n", loop_idx, LOOPS, effective_runs, effective_runs);
+                    fflush(stdout);
+                    break;
                 }
 
                 if ((i + 1) % 10 == 0 || i == effective_runs - 1) {
@@ -830,6 +1054,9 @@ int main(void) {
 
     if (capture_log) {
         fclose(capture_log);
+    }
+    if (detailed_perf_log) {
+        fclose(detailed_perf_log);
     }
     fclose(log);
     return 0;
