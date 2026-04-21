@@ -19,6 +19,18 @@ DETAILED_PERF_ENABLE ?= 1
 DETAILED_PERF_OUTPUT_DIR ?= logs/detailed_perf_runs
 DETAILED_PERF_LOG_FILE ?= logs/detailed_perf_runs.csv
 DETAILED_PERF_INTERVAL_SEC ?= 1
+TEMP_CONTROL_LOG_FILE ?= logs/temp_controlled_runs.csv
+TEMP_CONTROL_SAMPLE_DIR ?= logs/temp_controlled_samples
+TEMP_CONTROL_THRESHOLD_C ?= 40
+TEMP_CONTROL_MIN_PAUSE_SEC ?= 15
+TEMP_CONTROL_RAPL_INTERVAL_MS ?= 1
+TEMP_CONTROL_RAPL_EVENTS ?= power/energy-pkg/,power/energy-cores/,power/energy-gpu/,power/energy-ram/
+LOOPS ?= 1
+CPU_AFFINITY ?= 0
+SINGLE_CORE_LOG_FILE ?= logs/query_timing_single_core.csv
+SINGLE_CORE_SAMPLE_DIR ?= logs/single_core_rapl_samples
+SINGLE_CORE_RAPL_INTERVAL_MS ?= 100
+SINGLE_CORE_RAPL_EVENTS ?= power/energy-pkg/,power/energy-cores/,power/energy-gpu/,power/energy-ram/
 
 # Default target
 all: compile
@@ -37,11 +49,17 @@ run: compile
 #   make run-single QUERY=APX1090
 #   make run-single QUERY=APX1090-queryA.sql
 run-single: compile
-ifndef QUERY
-	$(error You must provide QUERY. Example: make run-single QUERY=APX1090)
-endif
+	@if [ -z "$(QUERY)" ]; then echo "You must provide QUERY. Example: make run-single QUERY=APX1090"; exit 1; fi
 	@$(SUDO_PRIME_CMD)
 	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) ./$(TARGET)
+
+# Run all queries or a filtered subset pinned to one logical CPU/thread
+# Usage:
+#   make run-single-core
+#   make run-single-core QUERY=APX1090 CPU_AFFINITY=2
+run-single-core: compile
+	@$(SUDO_PRIME_CMD)
+	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) CPU_AFFINITY=$(CPU_AFFINITY) LOG_FILE="$(SINGLE_CORE_LOG_FILE)" RAPL_SAMPLE_ENABLE=1 RAPL_SAMPLE_DIR="$(SINGLE_CORE_SAMPLE_DIR)" RAPL_SAMPLE_INTERVAL_MS=$(SINGLE_CORE_RAPL_INTERVAL_MS) RAPL_SAMPLE_EVENTS="$(SINGLE_CORE_RAPL_EVENTS)" ./$(TARGET)
 
 # Run all queries with PERF stat enabled (per query execution output files)
 run-perf: compile
@@ -52,9 +70,7 @@ run-perf: compile
 # Usage:
 #   make run-perf-single QUERY=APX1090
 run-perf-single: compile
-ifndef QUERY
-	$(error You must provide QUERY. Example: make run-perf-single QUERY=APX1090)
-endif
+	@if [ -z "$(QUERY)" ]; then echo "You must provide QUERY. Example: make run-perf-single QUERY=APX1090"; exit 1; fi
 	@$(SUDO_PRIME_CMD)
 	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) PERF_ENABLE=$(PERF_ENABLE) PERF_OUTPUT_DIR="$(PERF_OUTPUT_DIR)" PERF_EVENTS="$(PERF_EVENTS)" ./$(TARGET)
 
@@ -67,9 +83,7 @@ run-output-capture: compile
 # Usage:
 #   make run-output-capture-single QUERY=APX1090
 run-output-capture-single: compile
-ifndef QUERY
-	$(error You must provide QUERY. Example: make run-output-capture-single QUERY=APX1090)
-endif
+	@if [ -z "$(QUERY)" ]; then echo "You must provide QUERY. Example: make run-output-capture-single QUERY=APX1090"; exit 1; fi
 	@$(SUDO_PRIME_CMD)
 	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) OUTPUT_CAPTURE_ENABLE=$(OUTPUT_CAPTURE_ENABLE) OUTPUT_CAPTURE_DIR="$(OUTPUT_CAPTURE_DIR)" OUTPUT_CAPTURE_SQL_DIR="$(OUTPUT_CAPTURE_SQL_DIR)" OUTPUT_CAPTURE_LOG_FILE="$(OUTPUT_CAPTURE_LOG_FILE)" ./$(TARGET)
 
@@ -82,11 +96,22 @@ run-perf-detailed: compile
 # Usage:
 #   make run-perf-detailed-single QUERY=APX1090
 run-perf-detailed-single: compile
-ifndef QUERY
-	$(error You must provide QUERY. Example: make run-perf-detailed-single QUERY=APX1090)
-endif
+	@if [ -z "$(QUERY)" ]; then echo "You must provide QUERY. Example: make run-perf-detailed-single QUERY=APX1090"; exit 1; fi
 	@$(SUDO_PRIME_CMD)
 	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) DETAILED_PERF_ENABLE=$(DETAILED_PERF_ENABLE) DETAILED_PERF_OUTPUT_DIR="$(DETAILED_PERF_OUTPUT_DIR)" DETAILED_PERF_LOG_FILE="$(DETAILED_PERF_LOG_FILE)" DETAILED_PERF_INTERVAL_SEC=$(DETAILED_PERF_INTERVAL_SEC) ./$(TARGET)
+
+# Temperature-controlled run with 1 run per loop and cooldown between runs
+run-temp-controlled: compile
+	@$(SUDO_PRIME_CMD)
+	$(RUNNER_PREFIX) env TEMP_CONTROL_ENABLE=1 TEMP_CONTROL_LOG_FILE="$(TEMP_CONTROL_LOG_FILE)" TEMP_CONTROL_SAMPLE_DIR="$(TEMP_CONTROL_SAMPLE_DIR)" TEMP_CONTROL_THRESHOLD_C=$(TEMP_CONTROL_THRESHOLD_C) TEMP_CONTROL_MIN_PAUSE_SEC=$(TEMP_CONTROL_MIN_PAUSE_SEC) TEMP_CONTROL_RAPL_INTERVAL_MS=$(TEMP_CONTROL_RAPL_INTERVAL_MS) TEMP_CONTROL_RAPL_EVENTS="$(TEMP_CONTROL_RAPL_EVENTS)" LOOPS=$(LOOPS) RUNS_PER_LOOP=1 ./$(TARGET)
+
+# Temperature-controlled run for one query filter
+# Usage:
+#   make run-temp-controlled-single QUERY=APX1090 LOOPS=5
+run-temp-controlled-single: compile
+	@if [ -z "$(QUERY)" ]; then echo "You must provide QUERY. Example: make run-temp-controlled-single QUERY=APX1090"; exit 1; fi
+	@$(SUDO_PRIME_CMD)
+	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) TEMP_CONTROL_ENABLE=1 TEMP_CONTROL_LOG_FILE="$(TEMP_CONTROL_LOG_FILE)" TEMP_CONTROL_SAMPLE_DIR="$(TEMP_CONTROL_SAMPLE_DIR)" TEMP_CONTROL_THRESHOLD_C=$(TEMP_CONTROL_THRESHOLD_C) TEMP_CONTROL_MIN_PAUSE_SEC=$(TEMP_CONTROL_MIN_PAUSE_SEC) TEMP_CONTROL_RAPL_INTERVAL_MS=$(TEMP_CONTROL_RAPL_INTERVAL_MS) TEMP_CONTROL_RAPL_EVENTS="$(TEMP_CONTROL_RAPL_EVENTS)" LOOPS=$(LOOPS) RUNS_PER_LOOP=1 ./$(TARGET)
 
 # Optional: clean build artifacts
 clean:

@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 // query_runner.c
 // Build: gcc -O2 -o query_runner query_runner.c
 // Usage examples:
@@ -20,6 +21,7 @@
 #include <stdint.h>
 #include <limits.h>
 #include <strings.h>
+#include <sched.h>
 #include "rapl.h"
 
 #define MAX_FILES 4096
@@ -32,6 +34,7 @@
 #define DEFAULT_SIGLESS_ADDR "127.0.0.1:8000"
 #define DEFAULT_SIGLESS_CHANNEL "CH1"
 #define DEFAULT_SUDO_PASSWORD "a"
+#define DEFAULT_CPU_AFFINITY (-1)
 #define DEFAULT_PERF_OUTPUT_DIR "logs/perf_runs"
 #define DEFAULT_PERF_EVENTS "cycles,instructions,branches,branch-misses,cache-references,cache-misses,context-switches,cpu-migrations,page-faults,ref-cycles,cpu-clock,task-clock"
 #define DEFAULT_CAPTURE_OUTPUT_DIR "logs/query_outputs"
@@ -41,6 +44,15 @@
 #define DEFAULT_DETAILED_PERF_LOG_FILE "logs/detailed_perf_runs.csv"
 #define DEFAULT_DETAILED_PERF_INTERVAL_SEC 1
 #define DEFAULT_DETAILED_TURBOSTAT_COLUMNS "Core,CPU,Avg_MHz,Busy%,Bzy_MHz,TSC_MHz,IPC,CoreTmp,PkgTmp,PkgWatt,CorWatt,RAMWatt"
+#define DEFAULT_TEMP_CONTROL_LOG_FILE "logs/temp_controlled_runs.csv"
+#define DEFAULT_TEMP_CONTROL_SAMPLE_DIR "logs/temp_controlled_samples"
+#define DEFAULT_TEMP_CONTROL_THRESHOLD_C 40.0
+#define DEFAULT_TEMP_CONTROL_MIN_PAUSE_SEC 15
+#define DEFAULT_TEMP_CONTROL_RAPL_INTERVAL_MS 1
+#define DEFAULT_TEMP_CONTROL_RAPL_EVENTS "power/energy-pkg/,power/energy-cores/,power/energy-gpu/,power/energy-ram/"
+#define DEFAULT_RAPL_SAMPLE_DIR "logs/rapl_samples"
+#define DEFAULT_RAPL_SAMPLE_INTERVAL_MS 100
+#define DEFAULT_RAPL_SAMPLE_EVENTS "power/energy-pkg/,power/energy-cores/,power/energy-gpu/,power/energy-ram/"
 
 static double get_time_sec(void) {
     struct timespec ts;
@@ -192,6 +204,42 @@ static int env_is_true(const char *value) {
            strcmp(value, "YES") == 0 ||
            strcmp(value, "on") == 0 ||
            strcmp(value, "ON") == 0;
+}
+
+static int parse_cpu_affinity(const char *value, int *cpu_affinity) {
+    char *end = NULL;
+    long parsed;
+
+    if (!value || !*value) {
+        *cpu_affinity = DEFAULT_CPU_AFFINITY;
+        return 0;
+    }
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < -1 || parsed > INT_MAX) {
+        return -1;
+    }
+
+    *cpu_affinity = (int)parsed;
+    return 0;
+}
+
+static int apply_cpu_affinity(int cpu_affinity) {
+    cpu_set_t mask;
+
+    if (cpu_affinity < 0) {
+        return 0;
+    }
+
+    CPU_ZERO(&mask);
+    CPU_SET(cpu_affinity, &mask);
+
+    if (sched_setaffinity(0, sizeof(mask), &mask) != 0) {
+        return -1;
+    }
+
+    return 0;
 }
 
 static int ensure_dir_exists(const char *dir_path) {
@@ -443,6 +491,97 @@ static int tool_available(const char *tool_name) {
     return system(cmd) == 0;
 }
 
+static int parse_last_double_from_line(const char *line, double *value) {
+    const char *cursor = line;
+    int found = 0;
+    double parsed = 0.0;
+
+    while (*cursor) {
+        char *end = NULL;
+        double candidate = strtod(cursor, &end);
+        if (end != cursor) {
+            parsed = candidate;
+            found = 1;
+            cursor = end;
+        } else {
+            cursor++;
+        }
+    }
+
+    if (!found) {
+        return -1;
+    }
+
+    *value = parsed;
+    return 0;
+}
+
+static int read_package_temp_celsius(double *temp_c) {
+    const char *cmd = "sudo -n turbostat --quiet --Summary --show PkgTmp --interval 1 --num_iterations 1 2>/dev/null";
+    FILE *pipe = popen(cmd, "r");
+    char line[512];
+    char last_line[512];
+
+    if (!pipe) {
+        return -1;
+    }
+
+    last_line[0] = '\0';
+    while (fgets(line, sizeof(line), pipe)) {
+        if (line[0] == '\0' || line[0] == '\n') {
+            continue;
+        }
+        strncpy(last_line, line, sizeof(last_line) - 1);
+        last_line[sizeof(last_line) - 1] = '\0';
+    }
+
+    if (pclose(pipe) == -1) {
+        return -1;
+    }
+
+    if (last_line[0] == '\0') {
+        return -1;
+    }
+
+    return parse_last_double_from_line(last_line, temp_c);
+}
+
+static int wait_for_package_cooldown(int min_pause_sec,
+                                     double threshold_c,
+                                     double *waited_sec) {
+    double wait_started_sec = get_time_sec();
+
+    for (;;) {
+        double elapsed_sec = get_time_sec() - wait_started_sec;
+        if (elapsed_sec < (double)min_pause_sec) {
+            double remaining_sec = (double)min_pause_sec - elapsed_sec;
+            if (remaining_sec > 1.0) {
+                remaining_sec = 1.0;
+            }
+
+            struct timespec ts;
+            ts.tv_sec = (time_t)remaining_sec;
+            ts.tv_nsec = (long)((remaining_sec - (double)ts.tv_sec) * 1e9);
+            nanosleep(&ts, NULL);
+            continue;
+        }
+
+        double temp_c = 0.0;
+        if (read_package_temp_celsius(&temp_c) != 0) {
+            return -1;
+        }
+
+        if (temp_c <= threshold_c) {
+            if (waited_sec) {
+                *waited_sec = get_time_sec() - wait_started_sec;
+            }
+            return 0;
+        }
+
+        sleep(1);
+    }
+}
+
 static int write_detailed_perf_metadata_file(const char *detailed_perf_output_dir,
                                              const char *run_id,
                                              const char *run_started_utc,
@@ -485,7 +624,10 @@ int main(void) {
 
     const char *sigless_addr = DEFAULT_SIGLESS_ADDR;
     const char *sigless_channel = DEFAULT_SIGLESS_CHANNEL;
+    const char *cpu_affinity_env = getenv("CPU_AFFINITY");
     const char *sudo_password = getenv("SUDO_PASSWORD");
+    const char *runs_per_loop_env = getenv("RUNS_PER_LOOP");
+    const char *loops_env = getenv("LOOPS");
     const char *perf_enable_env = getenv("PERF_ENABLE");
     const char *perf_output_dir = getenv("PERF_OUTPUT_DIR");
     const char *perf_events = getenv("PERF_EVENTS");
@@ -498,16 +640,86 @@ int main(void) {
     const char *detailed_perf_log_file = getenv("DETAILED_PERF_LOG_FILE");
     const char *detailed_perf_interval_env = getenv("DETAILED_PERF_INTERVAL_SEC");
     const char *detailed_turbostat_columns = getenv("DETAILED_TURBOSTAT_COLUMNS");
+    const char *temp_control_enable_env = getenv("TEMP_CONTROL_ENABLE");
+    const char *temp_control_log_file = getenv("TEMP_CONTROL_LOG_FILE");
+    const char *temp_control_sample_dir = getenv("TEMP_CONTROL_SAMPLE_DIR");
+    const char *temp_control_threshold_env = getenv("TEMP_CONTROL_THRESHOLD_C");
+    const char *temp_control_min_pause_env = getenv("TEMP_CONTROL_MIN_PAUSE_SEC");
+    const char *temp_control_rapl_events = getenv("TEMP_CONTROL_RAPL_EVENTS");
+    const char *temp_control_rapl_interval_env = getenv("TEMP_CONTROL_RAPL_INTERVAL_MS");
+    const char *rapl_sample_enable_env = getenv("RAPL_SAMPLE_ENABLE");
+    const char *rapl_sample_dir = getenv("RAPL_SAMPLE_DIR");
+    const char *rapl_sample_events = getenv("RAPL_SAMPLE_EVENTS");
+    const char *rapl_sample_interval_env = getenv("RAPL_SAMPLE_INTERVAL_MS");
     int perf_enabled = env_is_true(perf_enable_env);
     int capture_enabled = env_is_true(capture_enable_env);
     int detailed_perf_enabled = env_is_true(detailed_perf_enable_env);
+    int temp_control_enabled = env_is_true(temp_control_enable_env);
+    int rapl_sample_enabled = env_is_true(rapl_sample_enable_env);
+    int runs_per_loop = RUNS;
+    int loop_count = LOOPS;
     int detailed_perf_interval_sec = DEFAULT_DETAILED_PERF_INTERVAL_SEC;
+    int temp_control_rapl_interval_ms = DEFAULT_TEMP_CONTROL_RAPL_INTERVAL_MS;
+    int rapl_sample_interval_ms = DEFAULT_RAPL_SAMPLE_INTERVAL_MS;
+    int temp_control_min_pause_sec = DEFAULT_TEMP_CONTROL_MIN_PAUSE_SEC;
+    double temp_control_threshold_c = DEFAULT_TEMP_CONTROL_THRESHOLD_C;
+    int cpu_affinity = DEFAULT_CPU_AFFINITY;
 
+    if (runs_per_loop_env && *runs_per_loop_env) {
+        int parsed_runs = atoi(runs_per_loop_env);
+        if (parsed_runs > 0) {
+            runs_per_loop = parsed_runs;
+        }
+    }
+    if (loops_env && *loops_env) {
+        int parsed_loops = atoi(loops_env);
+        if (parsed_loops > 0) {
+            loop_count = parsed_loops;
+        }
+    }
     if (detailed_perf_interval_env && *detailed_perf_interval_env) {
         int parsed_interval = atoi(detailed_perf_interval_env);
         if (parsed_interval > 0) {
             detailed_perf_interval_sec = parsed_interval;
         }
+    }
+    if (temp_control_threshold_env && *temp_control_threshold_env) {
+        double parsed_threshold = atof(temp_control_threshold_env);
+        if (parsed_threshold > 0.0) {
+            temp_control_threshold_c = parsed_threshold;
+        }
+    }
+    if (temp_control_min_pause_env && *temp_control_min_pause_env) {
+        int parsed_pause = atoi(temp_control_min_pause_env);
+        if (parsed_pause > 0) {
+            temp_control_min_pause_sec = parsed_pause;
+        }
+    }
+    if (temp_control_rapl_interval_env && *temp_control_rapl_interval_env) {
+        int parsed_interval = atoi(temp_control_rapl_interval_env);
+        if (parsed_interval > 0) {
+            temp_control_rapl_interval_ms = parsed_interval;
+        }
+    }
+    if (rapl_sample_interval_env && *rapl_sample_interval_env) {
+        int parsed_interval = atoi(rapl_sample_interval_env);
+        if (parsed_interval > 0) {
+            rapl_sample_interval_ms = parsed_interval;
+        }
+    }
+    if (parse_cpu_affinity(cpu_affinity_env, &cpu_affinity) != 0) {
+        fprintf(stderr, "Invalid CPU_AFFINITY value: %s\n", cpu_affinity_env);
+        return 1;
+    }
+
+    if (cpu_affinity >= 0) {
+        if (apply_cpu_affinity(cpu_affinity) != 0) {
+            fprintf(stderr, "Failed to pin process to logical CPU %d: %s\n",
+                    cpu_affinity, strerror(errno));
+            return 1;
+        }
+        printf("Pinned runner and child processes to logical CPU %d\n", cpu_affinity);
+        fflush(stdout);
     }
 
     if (capture_enabled && perf_enabled) {
@@ -520,6 +732,26 @@ int main(void) {
         }
         perf_enabled = 0;
         capture_enabled = 0;
+    }
+    if (temp_control_enabled) {
+        if (perf_enabled || capture_enabled || detailed_perf_enabled) {
+            fprintf(stderr, "TEMP_CONTROL_ENABLE overrides PERF_ENABLE, OUTPUT_CAPTURE_ENABLE, and DETAILED_PERF_ENABLE.\n");
+        }
+        if (rapl_sample_enabled) {
+            fprintf(stderr, "TEMP_CONTROL_ENABLE overrides RAPL_SAMPLE_ENABLE.\n");
+            rapl_sample_enabled = 0;
+        }
+        perf_enabled = 0;
+        capture_enabled = 0;
+        detailed_perf_enabled = 0;
+        runs_per_loop = 1;
+        if (!temp_control_log_file || !*temp_control_log_file) {
+            temp_control_log_file = DEFAULT_TEMP_CONTROL_LOG_FILE;
+        }
+        if (!temp_control_sample_dir || !*temp_control_sample_dir) {
+            temp_control_sample_dir = DEFAULT_TEMP_CONTROL_SAMPLE_DIR;
+        }
+        log_file = temp_control_log_file;
     }
 
     if (!perf_output_dir || !*perf_output_dir) {
@@ -546,6 +778,15 @@ int main(void) {
     if (!detailed_turbostat_columns || !*detailed_turbostat_columns) {
         detailed_turbostat_columns = DEFAULT_DETAILED_TURBOSTAT_COLUMNS;
     }
+    if (!temp_control_rapl_events || !*temp_control_rapl_events) {
+        temp_control_rapl_events = DEFAULT_TEMP_CONTROL_RAPL_EVENTS;
+    }
+    if (!rapl_sample_dir || !*rapl_sample_dir) {
+        rapl_sample_dir = DEFAULT_RAPL_SAMPLE_DIR;
+    }
+    if (!rapl_sample_events || !*rapl_sample_events) {
+        rapl_sample_events = DEFAULT_RAPL_SAMPLE_EVENTS;
+    }
 
     const char *filter = getenv("QUERY_FILTER"); // if NULL -> treat as "all"
     int filter_all = 0;
@@ -562,8 +803,13 @@ int main(void) {
     }
 
     if (needs_csv_header) {
-        fprintf(log,
-                "timestamp_utc,run_id,test_name,loop_index,loops,runs_per_loop,total_runs,total_elapsed_sec,failures,rapl_package_j,rapl_core_j,rapl_gpu_j,rapl_dram_j,query_dir,query_filter,sigless_addr,run_started_utc\n");
+        if (temp_control_enabled) {
+            fprintf(log,
+                    "timestamp_utc,run_id,test_name,loop_index,loops,runs_per_loop,total_runs,total_elapsed_sec,failures,rapl_package_j,rapl_core_j,rapl_gpu_j,rapl_dram_j,start_pkg_tmp_c,end_pkg_tmp_c,cooldown_wait_sec,cooldown_threshold_c,rapl_1ms_file,query_dir,query_filter,sigless_addr,run_started_utc\n");
+        } else {
+            fprintf(log,
+                    "timestamp_utc,run_id,test_name,loop_index,loops,runs_per_loop,total_runs,total_elapsed_sec,failures,rapl_package_j,rapl_core_j,rapl_gpu_j,rapl_dram_j,query_dir,query_filter,sigless_addr,run_started_utc\n");
+        }
         fflush(log);
     }
 
@@ -606,6 +852,7 @@ int main(void) {
         printf("Output capture mode enabled. Forcing runs_per_loop=1 (RUNS=%d ignored).\n", RUNS);
         printf("Capture outputs in %s\n", capture_output_dir);
         fflush(stdout);
+        runs_per_loop = 1;
     }
 
     if (perf_enabled) {
@@ -681,9 +928,70 @@ int main(void) {
             fflush(detailed_perf_log);
         }
 
-        printf("Detailed PERF mode enabled. Runs per loop follow RUNS=%d with continuous interval sampling.\n", RUNS);
+        printf("Detailed PERF mode enabled. Runs per loop follow RUNS=%d with continuous interval sampling.\n", runs_per_loop);
         printf("Detailed PERF outputs in %s\n", detailed_perf_output_dir);
         printf("Detailed turbostat columns: %s\n", detailed_turbostat_columns);
+        fflush(stdout);
+    }
+
+    if (temp_control_enabled) {
+        double probe_temp_c = 0.0;
+
+        if (!tool_available("perf")) {
+            fprintf(stderr, "perf is not available on PATH.\n");
+            if (capture_log) fclose(capture_log);
+            if (detailed_perf_log) fclose(detailed_perf_log);
+            fclose(log);
+            return 1;
+        }
+        if (!tool_available("turbostat")) {
+            fprintf(stderr, "turbostat is not available on PATH. Temperature gating will not work.\n");
+            if (capture_log) fclose(capture_log);
+            if (detailed_perf_log) fclose(detailed_perf_log);
+            fclose(log);
+            return 1;
+        }
+        if (ensure_dir_exists(temp_control_sample_dir) != 0) {
+            fprintf(stderr, "Failed to create temp-control sample dir: %s\n", temp_control_sample_dir);
+            if (capture_log) fclose(capture_log);
+            if (detailed_perf_log) fclose(detailed_perf_log);
+            fclose(log);
+            return 1;
+        }
+        if (read_package_temp_celsius(&probe_temp_c) != 0) {
+            fprintf(stderr, "Failed to read package temperature through turbostat.\n");
+            if (capture_log) fclose(capture_log);
+            if (detailed_perf_log) fclose(detailed_perf_log);
+            fclose(log);
+            return 1;
+        }
+
+        printf("Temp-controlled mode enabled. Runs per loop forced to 1.\n");
+        printf("Cooling threshold: %.1f C, minimum pause: %d sec\n", temp_control_threshold_c, temp_control_min_pause_sec);
+        printf("Temp-control samples in %s\n", temp_control_sample_dir);
+        printf("Initial package temperature: %.2f C\n", probe_temp_c);
+        fflush(stdout);
+    }
+
+    if (rapl_sample_enabled) {
+        if (!tool_available("perf")) {
+            fprintf(stderr, "perf is not available on PATH.\n");
+            if (capture_log) fclose(capture_log);
+            if (detailed_perf_log) fclose(detailed_perf_log);
+            fclose(log);
+            return 1;
+        }
+        if (ensure_dir_exists(rapl_sample_dir) != 0) {
+            fprintf(stderr, "Failed to create RAPL sample dir: %s\n", rapl_sample_dir);
+            if (capture_log) fclose(capture_log);
+            if (detailed_perf_log) fclose(detailed_perf_log);
+            fclose(log);
+            return 1;
+        }
+
+        printf("RAPL interval sampling enabled (normal mode).\n");
+        printf("RAPL sample interval: %d ms\n", rapl_sample_interval_ms);
+        printf("RAPL sample outputs in %s\n", rapl_sample_dir);
         fflush(stdout);
     }
 
@@ -728,8 +1036,8 @@ int main(void) {
 
     qsort(files, count, sizeof(char *), cmp_queries);
 
-    int core = 0;
-    if (rapl_init(core) != 0) {
+    int rapl_core = cpu_affinity >= 0 ? cpu_affinity : 0;
+    if (rapl_init(rapl_core) != 0) {
         fprintf(stderr, "rapl_init failed\n");
         for (int i = 0; i < count; i++) {
             free(files[i]);
@@ -752,7 +1060,7 @@ int main(void) {
     }
 
     for (int f = 0; f < count; f++) {
-        const int effective_runs = capture_enabled ? 1 : RUNS;
+        const int effective_runs = runs_per_loop;
         char rewritten_query_path[PATH_MAX];
         char source_query_path[PATH_MAX];
         char detailed_perf_file[PATH_MAX];
@@ -811,33 +1119,76 @@ int main(void) {
             }
         }
 
-        printf("Running %s  (%d runs x %d loops)\n", files[f], effective_runs, LOOPS);
+        printf("Running %s  (%d runs x %d loops)\n", files[f], effective_runs, loop_count);
         fflush(stdout);
 
         double file_total_elapsed = 0.0;
         int file_total_failures = 0;
 
-        for (int loop_idx = 1; loop_idx <= LOOPS; loop_idx++) {
+        for (int loop_idx = 1; loop_idx <= loop_count; loop_idx++) {
             double total_elapsed = 0.0;
             int failures = 0;
+            double start_pkg_tmp_c = 0.0;
+            double end_pkg_tmp_c = 0.0;
+            double cooldown_wait_sec = 0.0;
+            char temp_control_rapl_file[PATH_MAX];
+
+            temp_control_rapl_file[0] = '\0';
 
             char start_msg[512];
             int s1 = snprintf(start_msg, sizeof(start_msg),
                               "start,run_id=%s,test=%s,loop=%d/%d,runs=%d",
-                              run_id, files[f], loop_idx, LOOPS, effective_runs);
+                              run_id, files[f], loop_idx, loop_count, effective_runs);
             if (s1 > 0 && s1 < (int)sizeof(start_msg)) {
                 post_sigless_script(sigless_addr, sigless_channel, start_msg);
             }
 
-            rapl_before(log, core);
+            if (temp_control_enabled) {
+                if (read_package_temp_celsius(&start_pkg_tmp_c) != 0) {
+                    fprintf(stderr, "  Warning: failed to read starting package temperature for %s [loop %d/%d]\n",
+                            files[f], loop_idx, loop_count);
+                    failures++;
+                }
+            }
+
+            rapl_before(log, rapl_core);
 
             // Capture mode intentionally forces one run per loop; PERF and detailed PERF keep RUNS.
             for (int i = 0; i < effective_runs; i++) {
                 char cmd[MAX_CMD];
                 char capture_output_file[PATH_MAX];
+                char rapl_sample_file[PATH_MAX];
                 capture_output_file[0] = '\0';
+                rapl_sample_file[0] = '\0';
 
-                if (detailed_perf_enabled) {
+                if (temp_control_enabled) {
+                    char safe_name[256];
+                    sanitize_for_filename(files[f], safe_name, sizeof(safe_name));
+
+                    int rp = snprintf(temp_control_rapl_file, sizeof(temp_control_rapl_file),
+                                      "%s/%s__%s__loop%d_run%d.rapl.csv",
+                                      temp_control_sample_dir, run_id, safe_name, loop_idx, i + 1);
+                    if (rp <= 0 || rp >= (int)sizeof(temp_control_rapl_file)) {
+                        failures++;
+                        fprintf(stderr,
+                                "  Warning: temp-control RAPL path truncated for %s [loop %d/%d run %d/%d]\n",
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
+                        continue;
+                    }
+
+                    int n = snprintf(cmd, sizeof(cmd),
+                                     "perf stat -a -I %d -x, -e %s -o \"%s\" -- "
+                                     "sudo -n -u postgres psql -d tpch -f \"%s\" > /dev/null 2>&1",
+                                     temp_control_rapl_interval_ms, temp_control_rapl_events,
+                                     temp_control_rapl_file, source_query_path);
+                    if (n <= 0 || n >= (int)sizeof(cmd)) {
+                        failures++;
+                        fprintf(stderr,
+                                "  Warning: temp-control command truncated for %s [loop %d/%d run %d/%d]\n",
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
+                        continue;
+                    }
+                } else if (detailed_perf_enabled) {
                     const char *query_exec_path = source_query_path;
 
                     int n = snprintf(cmd, sizeof(cmd),
@@ -858,7 +1209,34 @@ int main(void) {
                         failures++;
                         fprintf(stderr,
                                 "  Warning: detailed PERF command truncated for %s [loop %d/%d]\n",
-                                files[f], loop_idx, LOOPS);
+                                files[f], loop_idx, loop_count);
+                        continue;
+                    }
+                } else if (rapl_sample_enabled) {
+                    char safe_name[256];
+                    sanitize_for_filename(files[f], safe_name, sizeof(safe_name));
+
+                    int rp = snprintf(rapl_sample_file, sizeof(rapl_sample_file),
+                                      "%s/%s__%s__loop%d_run%d.rapl.csv",
+                                      rapl_sample_dir, run_id, safe_name, loop_idx, i + 1);
+                    if (rp <= 0 || rp >= (int)sizeof(rapl_sample_file)) {
+                        failures++;
+                        fprintf(stderr,
+                                "  Warning: RAPL sample path truncated for %s [loop %d/%d run %d/%d]\n",
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
+                        continue;
+                    }
+
+                    int n = snprintf(cmd, sizeof(cmd),
+                                     "perf stat -a -I %d -x, -e %s -o \"%s\" -- "
+                                     "sudo -n -u postgres psql -d tpch -f \"%s/%s\" > /dev/null 2>&1",
+                                     rapl_sample_interval_ms, rapl_sample_events,
+                                     rapl_sample_file, query_dir, files[f]);
+                    if (n <= 0 || n >= (int)sizeof(cmd)) {
+                        failures++;
+                        fprintf(stderr,
+                                "  Warning: RAPL sample command truncated for %s [loop %d/%d run %d/%d]\n",
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
                         continue;
                     }
                 } else if (capture_enabled) {
@@ -871,7 +1249,7 @@ int main(void) {
                         failures++;
                         fprintf(stderr,
                                 "  Warning: output path truncated for %s [loop %d/%d run %d/%d]\n",
-                                files[f], loop_idx, LOOPS, i + 1, effective_runs);
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
                         continue;
                     }
 
@@ -882,7 +1260,7 @@ int main(void) {
                         failures++;
                         fprintf(stderr,
                                 "  Warning: capture command truncated for %s [loop %d/%d run %d/%d]\n",
-                                files[f], loop_idx, LOOPS, i + 1, effective_runs);
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
                         continue;
                     }
                 } else if (perf_enabled) {
@@ -896,7 +1274,7 @@ int main(void) {
                         failures++;
                         fprintf(stderr,
                                 "  Warning: PERF output path truncated for %s [loop %d/%d run %d/%d]\n",
-                                files[f], loop_idx, LOOPS, i + 1, effective_runs);
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
                         continue;
                     }
 
@@ -909,7 +1287,7 @@ int main(void) {
                         failures++;
                         fprintf(stderr,
                                 "  Warning: PERF command truncated for %s [loop %d/%d run %d/%d]\n",
-                                files[f], loop_idx, LOOPS, i + 1, effective_runs);
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
                         continue;
                     }
                 } else {
@@ -920,7 +1298,7 @@ int main(void) {
                         failures++;
                         fprintf(stderr,
                                 "  Warning: command truncated for %s [loop %d/%d run %d/%d]\n",
-                                files[f], loop_idx, LOOPS, i + 1, effective_runs);
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
                         continue;
                     }
                 }
@@ -936,10 +1314,18 @@ int main(void) {
                     failures++;
                     if (detailed_perf_enabled) {
                         fprintf(stderr, "  Warning: detailed PERF batch failed (code %d) for %s [loop %d/%d]\n",
-                                ret, files[f], loop_idx, LOOPS);
+                                ret, files[f], loop_idx, loop_count);
                     } else {
                         fprintf(stderr, "  Warning: run %d failed (code %d) for %s [loop %d/%d]\n",
-                                i + 1, ret, files[f], loop_idx, LOOPS);
+                                i + 1, ret, files[f], loop_idx, loop_count);
+                    }
+                }
+
+                if (temp_control_enabled) {
+                    if (read_package_temp_celsius(&end_pkg_tmp_c) != 0) {
+                        fprintf(stderr, "  Warning: failed to read ending package temperature for %s [loop %d/%d]\n",
+                                files[f], loop_idx, loop_count);
+                        failures++;
                     }
                 }
 
@@ -992,14 +1378,24 @@ int main(void) {
                 }
 
                 if (detailed_perf_enabled) {
-                    printf("  loop %d/%d completed %d/%d\n", loop_idx, LOOPS, effective_runs, effective_runs);
+                    printf("  loop %d/%d completed %d/%d\n", loop_idx, loop_count, effective_runs, effective_runs);
                     fflush(stdout);
                     break;
                 }
 
                 if ((i + 1) % 10 == 0 || i == effective_runs - 1) {
-                    printf("  loop %d/%d completed %d/%d\n", loop_idx, LOOPS, i + 1, effective_runs);
+                    printf("  loop %d/%d completed %d/%d\n", loop_idx, loop_count, i + 1, effective_runs);
                     fflush(stdout);
+                }
+            }
+
+            if (temp_control_enabled && !(f == count - 1 && loop_idx == loop_count)) {
+                if (wait_for_package_cooldown(temp_control_min_pause_sec,
+                                              temp_control_threshold_c,
+                                              &cooldown_wait_sec) != 0) {
+                    fprintf(stderr, "  Warning: failed while waiting for package cooldown after %s [loop %d/%d]\n",
+                            files[f], loop_idx, loop_count);
+                    failures++;
                 }
             }
 
@@ -1012,9 +1408,20 @@ int main(void) {
             fprintf(log, ",");
             csv_write_field(log, files[f]);
             fprintf(log, ",%d,%d,%d,%d,%.6f,%d,",
-                    loop_idx, LOOPS, effective_runs, effective_runs * LOOPS, total_elapsed, failures);
-            rapl_after(log, core);
+                    loop_idx, loop_count, effective_runs, effective_runs * loop_count, total_elapsed, failures);
+            rapl_after(log, rapl_core);
             fprintf(log, ",");
+
+            if (temp_control_enabled) {
+                fprintf(log, "%.6f,%.6f,%.6f,%.1f,",
+                        start_pkg_tmp_c,
+                        end_pkg_tmp_c,
+                        cooldown_wait_sec,
+                        temp_control_threshold_c);
+                csv_write_field(log, temp_control_rapl_file);
+                fprintf(log, ",");
+            }
+
             csv_write_field(log, query_dir);
             fprintf(log, ",");
             csv_write_field(log, filter_all ? "all" : filter);
@@ -1028,7 +1435,7 @@ int main(void) {
             char end_msg[512];
             int s2 = snprintf(end_msg, sizeof(end_msg),
                               "end,run_id=%s,test=%s,loop=%d/%d,runs=%d,elapsed_sec=%.6f,failures=%d",
-                              run_id, files[f], loop_idx, LOOPS, effective_runs, total_elapsed, failures);
+                              run_id, files[f], loop_idx, loop_count, effective_runs, total_elapsed, failures);
             if (s2 > 0 && s2 < (int)sizeof(end_msg)) {
                 post_sigless_script(sigless_addr, sigless_channel, end_msg);
             }
@@ -1036,10 +1443,10 @@ int main(void) {
             file_total_elapsed += total_elapsed;
             file_total_failures += failures;
             printf("  loop %d/%d total time: %.6f sec (failures: %d)\n",
-                   loop_idx, LOOPS, total_elapsed, failures);
+                   loop_idx, loop_count, total_elapsed, failures);
             fflush(stdout);
 
-            if (SET_PAUSE_SEC > 0 && !(f == count - 1 && loop_idx == LOOPS)) {
+            if (!temp_control_enabled && SET_PAUSE_SEC > 0 && !(f == count - 1 && loop_idx == loop_count)) {
                 printf("  pausing %d seconds before next set...\n", SET_PAUSE_SEC);
                 fflush(stdout);
                 sleep(SET_PAUSE_SEC);
