@@ -615,6 +615,127 @@ static int write_detailed_perf_metadata_file(const char *detailed_perf_output_di
     return 0;
 }
 
+static int write_combined_perf_script(const char *script_path,
+                                      const char *rapl_sample_file,
+                                      const char *rapl_sample_events,
+                                      int rapl_sample_interval_ms,
+                                      const char *detailed_turbostat_file,
+                                      const char *detailed_turbostat_columns,
+                                      int detailed_perf_interval_sec,
+                                      const char *detailed_perf_file,
+                                      const char *perf_events,
+                                      const char *query_exec_path,
+                                      int effective_runs) {
+    FILE *fp = fopen(script_path, "w");
+    if (!fp) {
+        return -1;
+    }
+
+    fprintf(fp, "#!/bin/sh\n");
+    fprintf(fp, "set -eu\n");
+    fprintf(fp, "perf stat -a -I %d -x, -e %s -o \"%s\" -- sleep 999999 >/dev/null 2>&1 &\n",
+            rapl_sample_interval_ms, rapl_sample_events, rapl_sample_file);
+    fprintf(fp, "sample_pid=$!\n");
+    fprintf(fp, "turbostat --quiet --show \"%s\" --interval %d >> \"%s\" 2>/dev/null &\n",
+            detailed_turbostat_columns, detailed_perf_interval_sec, detailed_turbostat_file);
+    fprintf(fp, "tpid=$!\n");
+    fprintf(fp, "perf stat --append -I %d -x, -a -e %s -o \"%s\" -- sudo -n sh -c 'r=1; while [ \"$r\" -le %d ]; do sudo -n -u postgres psql -d tpch -f \"%s\" > /dev/null 2>&1 || exit $?; r=$((r+1)); done'\n",
+            detailed_perf_interval_sec * 1000, perf_events, detailed_perf_file,
+            effective_runs, query_exec_path);
+    fprintf(fp, "status=$?\n");
+    fprintf(fp, "kill -INT $sample_pid >/dev/null 2>&1 || true\n");
+    fprintf(fp, "kill -INT $tpid >/dev/null 2>&1 || true\n");
+    fprintf(fp, "wait $sample_pid >/dev/null 2>&1 || true\n");
+    fprintf(fp, "wait $tpid >/dev/null 2>&1 || true\n");
+    fprintf(fp, "exit $status\n");
+
+    if (fclose(fp) != 0) {
+        return -1;
+    }
+
+    if (chmod(script_path, 0700) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int pin_postgres_to_cpu(int cpu_affinity) {
+    char cmd[1024];
+    int n;
+
+    printf("Using taskset to pin postgres processes to CPU %d...\n", cpu_affinity);
+    fflush(stdout);
+
+    /* First, restart postgres to ensure fresh processes */
+    n = snprintf(cmd, sizeof(cmd),
+                 "sudo -n systemctl restart postgresql 2>&1");
+    if (n <= 0 || n >= (int)sizeof(cmd)) {
+        return -1;
+    }
+    int restart_ret = system(cmd);
+    if (restart_ret != 0) {
+        fprintf(stderr, "Failed to restart postgresql\n");
+        return -1;
+    }
+    sleep(2);
+
+    /* Get main postgres process PID and pin it; children will inherit affinity */
+    n = snprintf(cmd, sizeof(cmd),
+                 "MAIN_PID=$(sudo -n pgrep -f '^/usr/lib/postgresql.*/bin/postgres -D' | head -1); "
+                 "if [ -z \"$MAIN_PID\" ]; then MAIN_PID=$(sudo -n pgrep -f 'postgres: ' | head -1); fi; "
+                 "if [ -n \"$MAIN_PID\" ]; then sudo -n taskset -pc %d \"$MAIN_PID\"; fi",
+                 cpu_affinity);
+    if (n <= 0 || n >= (int)sizeof(cmd)) {
+        return -1;
+    }
+
+    FILE *pipe = popen(cmd, "r");
+    if (!pipe) {
+        fprintf(stderr, "Failed to execute taskset command\n");
+        return -1;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), pipe)) {
+        fprintf(stdout, "  %s", line);
+    }
+    int pipe_ret = pclose(pipe);
+
+    if (pipe_ret != 0) {
+        fprintf(stderr, "  Taskset command returned non-zero\n");
+    }
+
+    /* Verify the affinity was set by checking all postgres PIDs */
+    printf("Verifying affinity of all postgres processes:\n");
+    fflush(stdout);
+    n = snprintf(cmd, sizeof(cmd),
+                 "sudo -n pgrep -f 'postgres' | while read pid; do sudo -n taskset -pc \"$pid\" 2>/dev/null; done | grep -E 'affinity|pid'");
+    if (n <= 0 || n >= (int)sizeof(cmd)) {
+        return -1;
+    }
+    int verify_ret = system(cmd);
+
+    printf("PostgreSQL processes pinning complete (verification code: %d)\n", verify_ret);
+    fflush(stdout);
+    return 0;
+}
+
+static int unpin_postgres(void) {
+    /* Just restart postgres without any CPU affinity constraints */
+    const char *cmd_restart = "sudo -n systemctl restart postgresql >/dev/null 2>&1";
+
+    int ret = system(cmd_restart);
+    if (ret != 0) {
+        fprintf(stderr, "Warning: failed to restart postgresql\n");
+        return -1;
+    }
+
+    /* Give postgres time to start up */
+    sleep(2);
+    return 0;
+}
+
 int main(void) {
     const char *query_dir = getenv("QUERY_DIR");
     if (!query_dir) query_dir = DEFAULT_QUERY_DIR;
@@ -720,6 +841,15 @@ int main(void) {
         }
         printf("Pinned runner and child processes to logical CPU %d\n", cpu_affinity);
         fflush(stdout);
+
+        printf("Pinning PostgreSQL to logical CPU %d and restarting...\n", cpu_affinity);
+        fflush(stdout);
+        if (pin_postgres_to_cpu(cpu_affinity) != 0) {
+            fprintf(stderr, "Warning: failed to pin PostgreSQL to CPU %d; continuing anyway\n", cpu_affinity);
+        } else {
+            printf("PostgreSQL pinned and restarted on CPU %d\n", cpu_affinity);
+            fflush(stdout);
+        }
     }
 
     if (capture_enabled && perf_enabled) {
@@ -1132,8 +1262,10 @@ int main(void) {
             double end_pkg_tmp_c = 0.0;
             double cooldown_wait_sec = 0.0;
             char temp_control_rapl_file[PATH_MAX];
+            char combined_script_path[PATH_MAX];
 
             temp_control_rapl_file[0] = '\0';
+            combined_script_path[0] = '\0';
 
             char start_msg[512];
             int s1 = snprintf(start_msg, sizeof(start_msg),
@@ -1185,6 +1317,60 @@ int main(void) {
                         failures++;
                         fprintf(stderr,
                                 "  Warning: temp-control command truncated for %s [loop %d/%d run %d/%d]\n",
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
+                        continue;
+                    }
+                } else if (detailed_perf_enabled && rapl_sample_enabled) {
+                    char safe_name[256];
+                    char rapl_sample_file[PATH_MAX];
+                    sanitize_for_filename(files[f], safe_name, sizeof(safe_name));
+
+                    int rp = snprintf(rapl_sample_file, sizeof(rapl_sample_file),
+                                      "%s/%s__%s__loop%d_run%d.rapl.csv",
+                                      rapl_sample_dir, run_id, safe_name, loop_idx, i + 1);
+                    if (rp <= 0 || rp >= (int)sizeof(rapl_sample_file)) {
+                        failures++;
+                        fprintf(stderr,
+                                "  Warning: RAPL sample path truncated for %s [loop %d/%d run %d/%d]\n",
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
+                        continue;
+                    }
+
+                    const char *query_exec_path = source_query_path;
+            int sc = snprintf(combined_script_path, sizeof(combined_script_path),
+                      "/tmp/rapl_single_core_%s_%d_%d.sh",
+                      run_id, loop_idx, i + 1);
+            if (sc <= 0 || sc >= (int)sizeof(combined_script_path)) {
+            failures++;
+            fprintf(stderr,
+                "  Warning: combined script path truncated for %s [loop %d/%d run %d/%d]\n",
+                files[f], loop_idx, loop_count, i + 1, effective_runs);
+            continue;
+            }
+
+            if (write_combined_perf_script(combined_script_path,
+                           rapl_sample_file,
+                           rapl_sample_events,
+                           rapl_sample_interval_ms,
+                           detailed_turbostat_file,
+                           detailed_turbostat_columns,
+                           detailed_perf_interval_sec,
+                           detailed_perf_file,
+                           perf_events,
+                           query_exec_path,
+                           effective_runs) != 0) {
+            failures++;
+            fprintf(stderr,
+                "  Warning: failed to write combined script for %s [loop %d/%d run %d/%d]\n",
+                files[f], loop_idx, loop_count, i + 1, effective_runs);
+            continue;
+            }
+
+            int n = snprintf(cmd, sizeof(cmd), "sh \"%s\"", combined_script_path);
+                    if (n <= 0 || n >= (int)sizeof(cmd)) {
+                        failures++;
+                        fprintf(stderr,
+                                "  Warning: combined detailed PERF/RAPL command truncated for %s [loop %d/%d run %d/%d]\n",
                                 files[f], loop_idx, loop_count, i + 1, effective_runs);
                         continue;
                     }
@@ -1309,6 +1495,11 @@ int main(void) {
 
                 double elapsed = end - start;
                 total_elapsed += elapsed;
+
+                if (combined_script_path[0] != '\0') {
+                    unlink(combined_script_path);
+                    combined_script_path[0] = '\0';
+                }
 
                 if (ret != 0) {
                     failures++;
@@ -1457,6 +1648,14 @@ int main(void) {
                file_total_elapsed, file_total_failures);
 
         free(files[f]);
+    }
+
+    if (cpu_affinity >= 0) {
+        printf("Restoring PostgreSQL to use all CPUs...\n");
+        fflush(stdout);
+        if (unpin_postgres() != 0) {
+            fprintf(stderr, "Warning: failed to restore PostgreSQL CPU affinity\n");
+        }
     }
 
     if (capture_log) {
