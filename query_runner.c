@@ -22,6 +22,8 @@
 #include <limits.h>
 #include <strings.h>
 #include <sched.h>
+#include <ctype.h>
+#include <sys/wait.h>
 #include "rapl.h"
 
 #define MAX_FILES 4096
@@ -53,6 +55,7 @@
 #define DEFAULT_RAPL_SAMPLE_DIR "logs/rapl_samples"
 #define DEFAULT_RAPL_SAMPLE_INTERVAL_MS 100
 #define DEFAULT_RAPL_SAMPLE_EVENTS "power/energy-pkg/,power/energy-cores/,power/energy-gpu/,power/energy-ram/"
+#define DEFAULT_PLANNING_TIME_LOG_FILE "logs/planning_time.csv"
 
 static double get_time_sec(void) {
     struct timespec ts;
@@ -275,6 +278,30 @@ static int ensure_dir_exists(const char *dir_path) {
     }
 
     return 0;
+}
+
+static int ensure_parent_dir_exists(const char *file_path) {
+    char tmp[PATH_MAX];
+    const char *slash;
+    size_t len;
+
+    if (!file_path || !*file_path) {
+        return -1;
+    }
+
+    slash = strrchr(file_path, '/');
+    if (!slash) {
+        return 0;
+    }
+
+    len = (size_t)(slash - file_path);
+    if (len == 0 || len >= sizeof(tmp)) {
+        return (len == 0) ? 0 : -1;
+    }
+
+    memcpy(tmp, file_path, len);
+    tmp[len] = '\0';
+    return ensure_dir_exists(tmp);
 }
 
 static void sanitize_for_filename(const char *src, char *dst, size_t dst_size) {
@@ -513,6 +540,128 @@ static int parse_last_double_from_line(const char *line, double *value) {
     }
 
     *value = parsed;
+    return 0;
+}
+
+static int parse_planning_time_ms_from_line(const char *line, double *value) {
+    const char *marker = "Planning Time:";
+    const char *p = strstr(line, marker);
+    char *end = NULL;
+
+    if (!p) {
+        return 0;
+    }
+
+    p += strlen(marker);
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+
+    if (!*p) {
+        return -1;
+    }
+
+    *value = strtod(p, &end);
+    if (end == p) {
+        return -1;
+    }
+
+    return 1;
+}
+
+static int parse_execution_time_ms_from_line(const char *line, double *value) {
+    const char *marker = "Execution Time:";
+    const char *p = strstr(line, marker);
+    char *end = NULL;
+
+    if (!p) {
+        return 0;
+    }
+
+    p += strlen(marker);
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+
+    if (!*p) {
+        return -1;
+    }
+
+    *value = strtod(p, &end);
+    if (end == p) {
+        return -1;
+    }
+
+    return 1;
+}
+
+static int run_psql_capture_planning_time(const char *cmd,
+                                          double *planning_time_ms,
+                                          double *execution_time_ms,
+                                          int *exit_code) {
+    FILE *pipe = NULL;
+    char line[1024];
+    int found = 0;
+    double last_value = 0.0;
+    int exec_found = 0;
+    double last_exec_value = 0.0;
+    int status = 0;
+    int code = -1;
+
+    if (exit_code) {
+        *exit_code = -1;
+    }
+    if (planning_time_ms) {
+        *planning_time_ms = 0.0;
+    }
+    if (execution_time_ms) {
+        *execution_time_ms = -1.0;
+    }
+
+    pipe = popen(cmd, "r");
+    if (!pipe) {
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), pipe)) {
+        double parsed = 0.0;
+        int rc = parse_planning_time_ms_from_line(line, &parsed);
+        if (rc == 1) {
+            found = 1;
+            last_value = parsed;
+        }
+
+        rc = parse_execution_time_ms_from_line(line, &parsed);
+        if (rc == 1) {
+            exec_found = 1;
+            last_exec_value = parsed;
+        }
+    }
+
+    status = pclose(pipe);
+    if (status != -1) {
+        if (WIFEXITED(status)) {
+            code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            code = 128 + WTERMSIG(status);
+        }
+    }
+
+    if (exit_code) {
+        *exit_code = code;
+    }
+
+    if (!found) {
+        return 1;
+    }
+
+    if (planning_time_ms) {
+        *planning_time_ms = last_value;
+    }
+    if (execution_time_ms && exec_found) {
+        *execution_time_ms = last_exec_value;
+    }
+
     return 0;
 }
 
@@ -772,11 +921,14 @@ int main(void) {
     const char *rapl_sample_dir = getenv("RAPL_SAMPLE_DIR");
     const char *rapl_sample_events = getenv("RAPL_SAMPLE_EVENTS");
     const char *rapl_sample_interval_env = getenv("RAPL_SAMPLE_INTERVAL_MS");
+    const char *planning_time_enable_env = getenv("PLANNING_TIME_ENABLE");
+    const char *planning_time_log_file = getenv("PLANNING_TIME_LOG_FILE");
     int perf_enabled = env_is_true(perf_enable_env);
     int capture_enabled = env_is_true(capture_enable_env);
     int detailed_perf_enabled = env_is_true(detailed_perf_enable_env);
     int temp_control_enabled = env_is_true(temp_control_enable_env);
     int rapl_sample_enabled = env_is_true(rapl_sample_enable_env);
+    int planning_time_enabled = env_is_true(planning_time_enable_env);
     int runs_per_loop = RUNS;
     int loop_count = LOOPS;
     int detailed_perf_interval_sec = DEFAULT_DETAILED_PERF_INTERVAL_SEC;
@@ -785,6 +937,7 @@ int main(void) {
     int temp_control_min_pause_sec = DEFAULT_TEMP_CONTROL_MIN_PAUSE_SEC;
     double temp_control_threshold_c = DEFAULT_TEMP_CONTROL_THRESHOLD_C;
     int cpu_affinity = DEFAULT_CPU_AFFINITY;
+    int base_runs_per_loop = runs_per_loop;
 
     if (runs_per_loop_env && *runs_per_loop_env) {
         int parsed_runs = atoi(runs_per_loop_env);
@@ -828,6 +981,7 @@ int main(void) {
             rapl_sample_interval_ms = parsed_interval;
         }
     }
+    base_runs_per_loop = runs_per_loop;
     if (parse_cpu_affinity(cpu_affinity_env, &cpu_affinity) != 0) {
         fprintf(stderr, "Invalid CPU_AFFINITY value: %s\n", cpu_affinity_env);
         return 1;
@@ -882,6 +1036,22 @@ int main(void) {
             temp_control_sample_dir = DEFAULT_TEMP_CONTROL_SAMPLE_DIR;
         }
         log_file = temp_control_log_file;
+    }
+
+    if (planning_time_enabled) {
+        if (perf_enabled || capture_enabled || detailed_perf_enabled || temp_control_enabled || rapl_sample_enabled) {
+            fprintf(stderr, "PLANNING_TIME_ENABLE overrides PERF_ENABLE, OUTPUT_CAPTURE_ENABLE, DETAILED_PERF_ENABLE, TEMP_CONTROL_ENABLE, and RAPL_SAMPLE_ENABLE.\n");
+        }
+        perf_enabled = 0;
+        capture_enabled = 0;
+        detailed_perf_enabled = 0;
+        temp_control_enabled = 0;
+        rapl_sample_enabled = 0;
+        runs_per_loop = base_runs_per_loop;
+
+        if (!planning_time_log_file || !*planning_time_log_file) {
+            planning_time_log_file = DEFAULT_PLANNING_TIME_LOG_FILE;
+        }
     }
 
     if (!perf_output_dir || !*perf_output_dir) {
@@ -950,6 +1120,34 @@ int main(void) {
 
     FILE *capture_log = NULL;
     FILE *detailed_perf_log = NULL;
+    FILE *planning_time_log = NULL;
+    if (planning_time_enabled) {
+        struct stat plan_st;
+        int needs_planning_header;
+
+        if (ensure_parent_dir_exists(planning_time_log_file) != 0) {
+            fprintf(stderr, "Failed to create planning-time log directory for: %s\n", planning_time_log_file);
+            fclose(log);
+            return 1;
+        }
+
+        needs_planning_header = (stat(planning_time_log_file, &plan_st) != 0 || plan_st.st_size == 0);
+        planning_time_log = fopen(planning_time_log_file, "a");
+        if (!planning_time_log) {
+            perror("fopen planning time log file");
+            fclose(log);
+            return 1;
+        }
+
+        if (needs_planning_header) {
+            fprintf(planning_time_log,
+                    "timestamp_utc,run_id,test_name,loop_index,run_index,planning_time_ms,execution_time_ms,exit_code,source_query_file,query_dir,query_filter,run_started_utc\n");
+            fflush(planning_time_log);
+        }
+
+        printf("Planning-time mode enabled. Logging planning times to %s\n", planning_time_log_file);
+        fflush(stdout);
+    }
     if (capture_enabled) {
         struct stat cap_st;
         int needs_capture_header;
@@ -1320,6 +1518,17 @@ int main(void) {
                                 files[f], loop_idx, loop_count, i + 1, effective_runs);
                         continue;
                     }
+                } else if (planning_time_enabled) {
+                    int n = snprintf(cmd, sizeof(cmd),
+                                     "sudo -n -u postgres psql -d tpch -f \"%s\" 2>&1",
+                                     source_query_path);
+                    if (n <= 0 || n >= (int)sizeof(cmd)) {
+                        failures++;
+                        fprintf(stderr,
+                                "  Warning: planning-time command truncated for %s [loop %d/%d run %d/%d]\n",
+                                files[f], loop_idx, loop_count, i + 1, effective_runs);
+                        continue;
+                    }
                 } else if (detailed_perf_enabled && rapl_sample_enabled) {
                     char safe_name[256];
                     char rapl_sample_file[PATH_MAX];
@@ -1489,8 +1698,25 @@ int main(void) {
                     }
                 }
 
+                int ret = 0;
+                int planning_exit_code = 0;
+                int planning_status = 0;
+                double planning_time_ms = 0.0;
+                double execution_time_ms = -1.0;
+
                 double start = get_time_sec();
-                int ret = system(cmd);
+                if (planning_time_enabled) {
+                    planning_status = run_psql_capture_planning_time(cmd, &planning_time_ms, &execution_time_ms, &planning_exit_code);
+                    if (planning_exit_code != 0) {
+                        ret = planning_exit_code;
+                    } else if (planning_status != 0) {
+                        ret = 1;
+                    } else {
+                        ret = 0;
+                    }
+                } else {
+                    ret = system(cmd);
+                }
                 double end = get_time_sec();
 
                 double elapsed = end - start;
@@ -1510,6 +1736,36 @@ int main(void) {
                         fprintf(stderr, "  Warning: run %d failed (code %d) for %s [loop %d/%d]\n",
                                 i + 1, ret, files[f], loop_idx, loop_count);
                     }
+                }
+
+                if (planning_time_enabled && planning_time_log) {
+                    char timestamp_utc[32];
+
+                    utc_timestamp_now(timestamp_utc, sizeof(timestamp_utc));
+
+                    csv_write_field(planning_time_log, timestamp_utc);
+                    fprintf(planning_time_log, ",");
+                    csv_write_field(planning_time_log, run_id);
+                    fprintf(planning_time_log, ",");
+                    csv_write_field(planning_time_log, files[f]);
+                    fprintf(planning_time_log, ",%d,%d,", loop_idx, i + 1);
+                    if (planning_status == 0) {
+                        fprintf(planning_time_log, "%.6f", planning_time_ms);
+                    }
+                    fprintf(planning_time_log, ",");
+                    if (execution_time_ms >= 0.0) {
+                        fprintf(planning_time_log, "%.6f", execution_time_ms);
+                    }
+                    fprintf(planning_time_log, ",%d,", planning_exit_code);
+                    csv_write_field(planning_time_log, source_query_path);
+                    fprintf(planning_time_log, ",");
+                    csv_write_field(planning_time_log, query_dir);
+                    fprintf(planning_time_log, ",");
+                    csv_write_field(planning_time_log, filter_all ? "all" : filter);
+                    fprintf(planning_time_log, ",");
+                    csv_write_field(planning_time_log, run_started_utc);
+                    fprintf(planning_time_log, "\n");
+                    fflush(planning_time_log);
                 }
 
                 if (temp_control_enabled) {
@@ -1663,6 +1919,9 @@ int main(void) {
     }
     if (detailed_perf_log) {
         fclose(detailed_perf_log);
+    }
+    if (planning_time_log) {
+        fclose(planning_time_log);
     }
     fclose(log);
     return 0;

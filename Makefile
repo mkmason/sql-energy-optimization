@@ -25,6 +25,8 @@ TEMP_CONTROL_THRESHOLD_C ?= 40
 TEMP_CONTROL_MIN_PAUSE_SEC ?= 15
 TEMP_CONTROL_RAPL_INTERVAL_MS ?= 1
 TEMP_CONTROL_RAPL_EVENTS ?= power/energy-pkg/,power/energy-cores/,power/energy-gpu/,power/energy-ram/
+PLANNING_TIME_ENABLE ?= 1
+PLANNING_TIME_LOG_FILE ?= logs/planning_time.csv
 LOOPS ?= 1
 CPU_AFFINITY ?= 0
 SINGLE_CORE_LOG_FILE ?= logs/query_timing_single_core.csv
@@ -89,6 +91,19 @@ run-output-capture-single: compile
 	@if [ -z "$(QUERY)" ]; then echo "You must provide QUERY. Example: make run-output-capture-single QUERY=APX1090"; exit 1; fi
 	@$(SUDO_PRIME_CMD)
 	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) OUTPUT_CAPTURE_ENABLE=$(OUTPUT_CAPTURE_ENABLE) OUTPUT_CAPTURE_DIR="$(OUTPUT_CAPTURE_DIR)" OUTPUT_CAPTURE_SQL_DIR="$(OUTPUT_CAPTURE_SQL_DIR)" OUTPUT_CAPTURE_LOG_FILE="$(OUTPUT_CAPTURE_LOG_FILE)" ./$(TARGET)
+
+# Log planning time from EXPLAIN ANALYZE for all runs in a single CSV
+run-planning-time: compile
+	@$(SUDO_PRIME_CMD)
+	$(RUNNER_PREFIX) env PLANNING_TIME_ENABLE=$(PLANNING_TIME_ENABLE) PLANNING_TIME_LOG_FILE="$(PLANNING_TIME_LOG_FILE)" ./$(TARGET)
+
+# Log planning time for a specific query filter
+# Usage:
+#   make run-planning-time-single QUERY=APX1090
+run-planning-time-single: compile
+	@if [ -z "$(QUERY)" ]; then echo "You must provide QUERY. Example: make run-planning-time-single QUERY=APX1090"; exit 1; fi
+	@$(SUDO_PRIME_CMD)
+	$(RUNNER_PREFIX) env QUERY_FILTER=$(QUERY) PLANNING_TIME_ENABLE=$(PLANNING_TIME_ENABLE) PLANNING_TIME_LOG_FILE="$(PLANNING_TIME_LOG_FILE)" ./$(TARGET)
 
 # Detailed PERF run with interval sampling and turbostat temperature/frequency data
 run-perf-detailed: compile
